@@ -72,6 +72,7 @@ class SelectiveScanFn(torch.autograd.Function):
             u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
             False  # option to recompute out_z, not used here
         )
+        
         dz = rest[0] if ctx.has_z else None
         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
         dC = dC.squeeze(1) if getattr(ctx, "squeeze_C", False) else dC
@@ -81,7 +82,48 @@ class SelectiveScanFn(torch.autograd.Function):
                 ddelta_bias if delta_bias is not None else None,
                 None,
                 None)
+        
+        '''
+        # 3) 관대하게 언팩 (길이/순서 차이를 흡수)
+        du = ddelta = dA = dB = dC = dD = dz = ddelta_bias = None
+        if ctx.has_z:
+            # 보통: [du, ddelta, dA, dB, dC, dD, dz, ddelta_bias] (8개)
+            if len(res) >= 8:
+                du, ddelta, dA, dB, dC, dD, dz, ddelta_bias = res[:8]
+                # 여분 항목(더미 grad 등)은 무시
+            else:
+                raise RuntimeError(f"Unexpected grads from CUDA bwd (has_z): {len(res)}")
+        else:
+            # 보통: [du, ddelta, dA, dB, dC, dD, ddelta_bias] (7개)
+            if len(res) >= 7:
+                du, ddelta, dA, dB, dC, dD, ddelta_bias = res[:7]
+                dz = None
+            else:
+                raise RuntimeError(f"Unexpected grads from CUDA bwd (no z): {len(res)}")
 
+        # 4) 3D→4D로 들어갔던 B/C는 다시 squeeze
+        dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) and dB is not None else dB
+        dC = dC.squeeze(1) if getattr(ctx, "squeeze_C", False) and dC is not None else dC
+
+        # 5) bool 인자들에 대한 grad는 항상 None
+        d_delta_softplus = None
+        d_return_last_state = None
+
+        # 6) forward 인자 순서로 반환
+        # (u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+        return (
+            du,
+            ddelta,
+            dA,
+            dB,
+            dC,
+            dD if D is not None else None,
+            dz,
+            ddelta_bias if delta_bias is not None else None,
+            d_delta_softplus,
+            d_return_last_state,
+        )
+        '''
 
 def rms_norm_forward(
     x,
@@ -556,7 +598,6 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
         return (dxz, dconv1d_weight, dconv1d_bias, dx_proj_weight, ddelta_proj_weight,
-                None, None,
                 dA, dB, dC, dD,
                 ddelta_bias if delta_bias is not None else None,
                 # 6-None are delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps

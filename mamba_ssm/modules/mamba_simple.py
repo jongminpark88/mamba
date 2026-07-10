@@ -128,7 +128,10 @@ class Mamba(nn.Module):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                if seqlen == 1:
+                    out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                else:
+                    out, _, _ = self.step_chunked(hidden_states, conv_state, ssm_state)
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
@@ -251,6 +254,24 @@ class Mamba(nn.Module):
 
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
+
+    def step_chunked(self, hidden_states, conv_state, ssm_state):
+        """Multi-token incremental decode.
+
+        Sequentially calls ``step`` for each of the L positions, reusing the
+        in-place updated ``conv_state``/``ssm_state``. Equivalent to ``step``
+        when L == 1 but returns ``(B, L, D)``.
+        """
+        L = hidden_states.shape[1]
+        assert L >= 1, "step_chunked requires at least one token"
+        outs = []
+        for i in range(L):
+            out_i, conv_state, ssm_state = self.step(
+                hidden_states[:, i : i + 1], conv_state, ssm_state
+            )
+            outs.append(out_i)
+        out = torch.cat(outs, dim=1) if L > 1 else outs[0]
+        return out, conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device

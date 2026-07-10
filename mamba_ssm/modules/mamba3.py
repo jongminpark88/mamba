@@ -11,7 +11,8 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 try:
     from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
-except ImportError:
+# tilelang/tvm_ffi can raise non-ImportError (e.g. AttributeError) at import time
+except Exception:
     mamba3_mimo_combined = None
 
 from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
@@ -20,7 +21,8 @@ from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_
 
 try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
-except ImportError:    
+# cutlass-dsl/quack deps can raise non-ImportError at import time
+except Exception:
     mamba3_step_fn = None
 
 
@@ -164,13 +166,22 @@ class Mamba3(nn.Module):
         """
         batch, seqlen, dim = u.shape
 
+        is_decoding = False
         angle_dt_state, ssm_state, k_state, v_state  = None, None, None, None
         if inference_params is not None:
             inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
             angle_dt_state, ssm_state, k_state, v_state = self._get_states_from_cache(inference_params, inference_batch)
             if inference_params.seqlen_offset > 0:
-                out, _, _, _, _ = self.step(u, angle_dt_state, ssm_state, k_state, v_state)
-                return out
+                assert cu_seqlens is None, "Chunked/step decoding does not support cu_seqlens (varlen)"
+                if self.is_mimo:
+                    # The MIMO kernel cannot consume initial states, so decode
+                    # through the CuteDSL step kernel one token at a time.
+                    out, _, _, _, _ = self.step_chunked(u, angle_dt_state, ssm_state, k_state, v_state)
+                    return out
+                # SISO: fall through to the fused kernel below, injecting the
+                # cached states as Input_States (one kernel call per chunk).
+                # The final states are copied back to the cache as in prefill.
+                is_decoding = True
 
         # Apply in_proj
         zxBCdtAtrap = self.in_proj(u)
@@ -259,7 +270,14 @@ class Mamba3(nn.Module):
                 D=self.D,
                 Z=z if not self.is_outproj_norm else None,
                 chunk_size=self.chunk_size,
-                Input_States=None,
+                # SISO cache k_state is (B, R=1, nheads, d_state); the kernel
+                # expects (B, nheads, d_state) — symmetric to the unsqueeze(1)
+                # in the copy-back below.
+                Input_States=(
+                    (angle_dt_state, ssm_state, k_state.squeeze(1), v_state)
+                    if is_decoding
+                    else None
+                ),
                 return_final_states=ssm_state is not None,
                 cu_seqlens=cu_seqlens,
             )
@@ -438,7 +456,32 @@ class Mamba3(nn.Module):
         v_state.copy_(nxt_v_state)
 
         return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
-    
+
+    def step_chunked(self, u, angle_state, ssm_state, k_state, v_state):
+        """Multi-token incremental decode via the CuteDSL step kernel.
+
+        Fallback path for MIMO (whose kernel cannot consume initial states)
+        and for debugging; SISO decode goes through the fused
+        ``mamba3_siso_combined`` call in ``forward`` instead.
+
+        Sequentially calls ``step`` on each of the L tokens. ``step`` updates
+        all four states in place in the tensors passed in (``ssm_state`` by
+        the kernel; angle/k/v states are copied back at the end of ``step``),
+        so reusing the same cache tensors across iterations keeps the
+        inference cache current without any extra write-back.
+
+        u: (batch, seqlen, d_model)
+        Returns: out (batch, seqlen, d_model) plus the four updated states.
+        """
+        L = u.shape[1]
+        assert L >= 1, "step_chunked requires at least one token"
+        outs = []
+        for i in range(L):
+            out_i, _, _, _, _ = self.step(u[:, i], angle_state, ssm_state, k_state, v_state)
+            outs.append(out_i)
+        out = torch.stack(outs, dim=1)
+        return out, angle_state, ssm_state, k_state, v_state
+
     def allocate_inference_cache(self, batch_size, max_seqlen, device=None, dtype=None, inplace_state=None, **kwargs):
         device = self.in_proj.weight.device if device is None else device
         dtype = self.in_proj.weight.dtype if dtype is None else dtype

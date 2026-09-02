@@ -300,7 +300,7 @@ class Mamba3(nn.Module):
         _A = -heavy_tail_activation(A_proj.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
         DT = F.softplus(dd_dt + self.dt_bias)
-        trap = torch.sigmoid(trap_proj)
+        trap = torch.sigmoid(trap_proj).float()
 
         rank = self.mimo_rank if self.is_mimo else 1
         B = rearrange(B, "b (r g s) -> b r g s", g=self.num_bc_heads, r=rank)
@@ -312,8 +312,8 @@ class Mamba3(nn.Module):
         B = B.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
         C = C.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
     
-        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-        z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim).contiguous()
+        z = rearrange(z, "b (h p) -> b h p", p=self.headdim).contiguous()
 
         angles = angle_proj.unsqueeze(-2).expand(-1, self.nheads, -1)
 

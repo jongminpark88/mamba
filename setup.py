@@ -400,8 +400,9 @@ setup(
         "triton>=3.5.0",
         "transformers",
         "tilelang==0.1.8",
-        "apache-tvm-ffi<=0.1.12",
-        "quack-kernels>=0.3.4",
+        "apache-tvm-ffi==0.1.9",
+        "nvidia-cutlass-dsl==4.4.2",
+        "quack-kernels==0.3.4",
         # "causal_conv1d>=1.4.0",
     ],
 )

@@ -116,3 +116,79 @@ def test_mamba3_varlen_backward(is_mimo):
         if param.requires_grad:
             assert param.grad is not None, f"No gradient for param {name}"
             assert torch.isfinite(param.grad).all(), f"Non-finite gradient for param {name}"
+
+
+def test_mamba3_mimo_preprocess_aligns_cute_inputs():
+    """d_model=384 produces CuTe-compatible x/z strides and an fp32 trap."""
+    _require_cuda()
+    model = _make_model(
+        is_mimo=True,
+        d_model=384,
+        d_state=32,
+        mimo_rank=4,
+        chunk_size=8,
+    )
+    batch = 2
+    dtype = torch.bfloat16
+    source = torch.randn(
+        batch, 2 * model.d_inner, device="cuda", dtype=dtype
+    )
+    x = source[:, 0::2]
+    z = source[:, 1::2]
+    trap_source = torch.randn(
+        batch, 2 * model.nheads, device="cuda", dtype=dtype
+    )
+    trap = trap_source[:, 0::2]
+    assert not x.is_contiguous()
+    assert not z.is_contiguous()
+    assert not trap.is_contiguous()
+
+    projected = model._preprocess(
+        torch.randn(batch, model.nheads, device="cuda", dtype=dtype),
+        torch.randn(batch, model.nheads, device="cuda", dtype=dtype),
+        torch.randn(
+            batch,
+            model.mimo_rank * model.num_bc_heads * model.d_state,
+            device="cuda",
+            dtype=dtype,
+        ),
+        torch.randn(
+            batch,
+            model.mimo_rank * model.num_bc_heads * model.d_state,
+            device="cuda",
+            dtype=dtype,
+        ),
+        x,
+        z,
+        trap,
+        torch.randn(
+            batch, model.num_rope_angles, device="cuda", dtype=dtype
+        ),
+    )
+    _, _, _, aligned_x, aligned_z, aligned_trap, _, _ = projected
+    assert aligned_x.is_contiguous()
+    assert aligned_z.is_contiguous()
+    assert aligned_trap.dtype == torch.float32
+
+
+def test_mamba3_mimo_cute_step_matches_tilelang_full_forward():
+    """TileLang full forward and CuTe zero-state step inference must agree."""
+    _require_cuda()
+    model = _make_model(
+        is_mimo=True,
+        d_model=384,
+        d_state=32,
+        mimo_rank=4,
+        chunk_size=8,
+    )
+    inputs = torch.randn(
+        2, 16, 384, device="cuda", dtype=torch.bfloat16
+    )
+    states = model.allocate_inference_cache(batch_size=2, max_seqlen=16)
+    with torch.no_grad():
+        reference = model(inputs)
+        output, *_ = model.step_chunked(inputs, *states)
+
+    torch.testing.assert_close(
+        output.float(), reference.float(), rtol=0.1, atol=0.1
+    )

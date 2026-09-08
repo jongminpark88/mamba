@@ -62,8 +62,11 @@ class _Mamba3Function(torch.autograd.Function):
         ctx.dtype = dtype
         ctx.fuse_pregate_headwise_rms_norm = fuse_pregate_headwise_rms_norm
         ctx.outproj_norm_eps = outproj_norm_eps
+        # TileLang checks exact strides even on singleton axes. For S=1,
+        # contiguous() alone can preserve a transposed [B, H, 1] stride (..., H).
+        # Flatten and restore the shape to canonicalize strides without another copy.
         (Q, K, V, ADT, DT, Trap, Q_bias, K_bias, MIMO_V, MIMO_Z, MIMO_Out, Out_Norm_Weight, Angles, D, Z) = tuple(
-            t.contiguous() if t is not None else None
+            t.contiguous().view(-1).view(t.shape) if t is not None else None
             for t in (
                 Q, K, V, ADT, DT, Trap, Q_bias, K_bias, MIMO_V, MIMO_Z, MIMO_Out, Out_Norm_Weight, Angles, D, Z,
             )

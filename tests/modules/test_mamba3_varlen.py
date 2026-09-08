@@ -192,3 +192,27 @@ def test_mamba3_mimo_cute_step_matches_tilelang_full_forward():
     torch.testing.assert_close(
         output.float(), reference.float(), rtol=0.1, atol=0.1
     )
+
+
+@pytest.mark.parametrize("batch_size,varlen", [(1, False), (2, False), (1, True)])
+def test_mamba3_mimo_single_token_prefill_matches_full_forward(batch_size, varlen):
+    """Length-one prefill must satisfy TileLang strides and initialize the step cache."""
+    from mamba_ssm.utils.generation import InferenceParams
+
+    _require_cuda()
+    torch.manual_seed(8)
+    model = _make_model(
+        is_mimo=True, d_model=384, d_state=32, mimo_rank=4, chunk_size=16,
+    )
+    inputs = torch.randn(batch_size, 3, 384, device="cuda", dtype=torch.bfloat16)
+    inference = InferenceParams(max_seqlen=3, max_batch_size=batch_size)
+    kwargs = {"cu_seqlens": _cu_seqlens([1], "cuda")} if varlen else {}
+    with torch.no_grad():
+        reference = model(inputs)
+        outputs = [model(inputs[:, :1], inference_params=inference, **kwargs)]
+        for offset in (1, 2):
+            inference.seqlen_offset = offset
+            outputs.append(model(inputs[:, offset:offset + 1], inference_params=inference))
+    actual = torch.cat(outputs, dim=1)
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=0.1, atol=0.1)
+    assert all(torch.isfinite(state).all() for state in inference.key_value_memory_dict[0])

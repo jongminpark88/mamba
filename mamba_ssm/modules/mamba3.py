@@ -173,12 +173,19 @@ class Mamba3(nn.Module):
             angle_dt_state, ssm_state, k_state, v_state = self._get_states_from_cache(inference_params, inference_batch)
             if inference_params.seqlen_offset > 0:
                 assert cu_seqlens is None, "Chunked/step decoding does not support cu_seqlens (varlen)"
+                if not self.is_mimo and seqlen == 1:
+                    # A single token needs only the recurrent kernel, not the
+                    # sequence kernel's chunk-sized intermediate buffers.
+                    out, _, _, _, _ = self.step(
+                        u[:, 0, :], angle_dt_state, ssm_state, k_state, v_state
+                    )
+                    return out.unsqueeze(1)
                 if self.is_mimo:
                     # The MIMO kernel cannot consume initial states, so decode
                     # through the CuteDSL step kernel one token at a time.
                     out, _, _, _, _ = self.step_chunked(u, angle_dt_state, ssm_state, k_state, v_state)
                     return out
-                # SISO: fall through to the fused kernel below, injecting the
+                # Multi-token SISO: fall through to the fused kernel, injecting the
                 # cached states as Input_States (one kernel call per chunk).
                 # The final states are copied back to the cache as in prefill.
                 is_decoding = True
@@ -461,8 +468,9 @@ class Mamba3(nn.Module):
         """Multi-token incremental decode via the CuteDSL step kernel.
 
         Fallback path for MIMO (whose kernel cannot consume initial states)
-        and for debugging; SISO decode goes through the fused
-        ``mamba3_siso_combined`` call in ``forward`` instead.
+        and for debugging; multi-token SISO decode goes through the fused
+        ``mamba3_siso_combined`` call in ``forward`` instead. Single-token
+        SISO decode calls ``step`` directly.
 
         Sequentially calls ``step`` on each of the L tokens. ``step`` updates
         all four states in place in the tensors passed in (``ssm_state`` by
